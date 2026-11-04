@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
-import type { Failure, Job, Progress, Request, Task } from '../types'
+import type { Change, Failure, Job, Progress, Request, Task } from '../types'
 
 // 진행 상황 파일 폴더. 세션마다 {세션ID}.json 하나를 Claude 가 적는다(선택)
 // PC 마다 사용자 폴더가 달라 session.start 에서 환경변수로 정한다
@@ -22,6 +22,8 @@ const error = atom({ plugin: 'task-progress', key: 'error' } as const, null)
 const request = atom({ plugin: 'task-progress', key: 'request' } as const, null)
 const jobs = atom({ plugin: 'task-progress', key: 'jobs' } as const, [])
 const failures = atom({ plugin: 'task-progress', key: 'failures' } as const, [])
+const touched = atom({ plugin: 'task-progress', key: 'touched' } as const, [])
+const changes = atom({ plugin: 'task-progress', key: 'changes' } as const, [])
 
 export function percentOf(t: Task): number {
   if (typeof t.percent === 'number') return Math.max(0, Math.min(100, t.percent))
@@ -183,6 +185,245 @@ export function clearedFile(reason: string, sessionId: string): string | null {
   return reason === 'clear' ? `${sessionId}.json` : null
 }
 
+// ---- 미커밋 파일: 이 세션에서 고쳤고 아직 커밋하지 않은 파일 ----
+
+// 파일을 고치는 도구와 그 경로 인자
+const EDIT_TOOLS: Record<string, string> = { Write: 'file_path', Edit: 'file_path', NotebookEdit: 'notebook_path' }
+const CHANGES_POLL_MS = 10000
+const DIFF_INPUT_MAX = 4000
+
+export function normPath(p: string): string {
+  return p.replace(/\\/g, '/').replace(/\/+$/, '')
+}
+
+export function dirOf(p: string): string {
+  const n = normPath(p)
+  const i = n.lastIndexOf('/')
+  return i > 0 ? n.slice(0, i) : n
+}
+
+// 저장소 루트 기준 상대경로. Windows 는 대소문자를 가리지 않아 소문자로 비교한다. 루트 밖이면 null
+export function relTo(root: string, path: string): string | null {
+  const r = normPath(root)
+  const p = normPath(path)
+  return p.toLowerCase().startsWith(`${r.toLowerCase()}/`) ? p.slice(r.length + 1) : null
+}
+
+// git status --porcelain -z 결과: 경로마다 XY 두 글자. 이름 변경(R, C)은 뒤에 원래 경로가 한 칸 더 온다
+export function parseStatusZ(out: string): Map<string, string> {
+  const map = new Map<string, string>()
+  const parts = out.split('\0')
+  for (let i = 0; i < parts.length; i++) {
+    const s = parts[i] ?? ''
+    if (s.length < 4) continue
+    const xy = s.slice(0, 2)
+    map.set(s.slice(3), xy)
+    if (xy[0] === 'R' || xy[0] === 'C') i++
+  }
+  return map
+}
+
+// git diff --numstat -z 결과: "추가\t삭제\t경로". 바이너리는 - 로 와서 0 으로 본다
+export function parseNumstatZ(out: string): Map<string, { added: number; removed: number }> {
+  const map = new Map<string, { added: number; removed: number }>()
+  for (const s of out.split('\0')) {
+    const m = /^(-|\d+)\t(-|\d+)\t(.+)$/.exec(s)
+    if (!m) continue
+    map.set(m[3]!, { added: Number(m[1]) || 0, removed: Number(m[2]) || 0 })
+  }
+  return map
+}
+
+export function statusLabel(xy: string): string {
+  if (xy === '??' || xy.includes('A')) return '새 파일'
+  if (xy.includes('D')) return '삭제'
+  if (xy.includes('R')) return '이름 변경'
+  return '수정'
+}
+
+// diff 지문. 요약을 다시 만들지 가르는 값이라 짧고 내용이 바뀌면 달라지면 된다
+export function diffKey(text: string): string {
+  let h = 0
+  for (let i = 0; i < text.length; i++) h = (h * 31 + text.charCodeAt(i)) | 0
+  return `${text.length}:${h}`
+}
+
+// 바뀐 내용을 한 줄로 적게 하는 질문. diff 원문은 태그로 감싸 지시와 분리한다
+export function diffSummaryPrompt(name: string, diff: string): string {
+  return [
+    `아래 <diff> 는 파일 ${name} 의 아직 커밋하지 않은 변경이다. 무엇을 바꿨는지 한국어 한 문장으로 적어라.`,
+    '30자 안팎, "~ 추가", "~ 수정" 처럼 명사형으로 끝낸다. 답은 그 문장 하나만 쓴다. 따옴표, 머리말을 붙이지 않는다.',
+    `<diff>\n${diff.slice(0, DIFF_INPUT_MAX)}\n</diff>`,
+  ].join('\n')
+}
+
+// git 실행. 먼저 PATH 의 git 을 쓰고, 못 띄우면 ProgramFiles 아래 Git for Windows 를 쓴다.
+// 경로는 코드에 적지 않고 환경변수로 만든다. 처음 성공한 실행 파일을 기억한다
+let gitExe: string | null = null
+async function git($: EngineInterface, args: string[], timeoutMs: number) {
+  if (gitExe) return $.process.run([gitExe, ...args], { timeoutMs })
+  const pf = await $.env.get('ProgramFiles')
+  const candidates = ['git', ...(pf ? [`${normPath(pf)}/Git/cmd/git.exe`] : [])]
+  let last: unknown = null
+  for (const exe of candidates) {
+    try {
+      const r = await $.process.run([exe, ...args], { timeoutMs })
+      gitExe = exe
+      return r
+    } catch (err) {
+      last = err
+    }
+  }
+  throw last
+}
+
+// 고친 파일들의 git 상태를 읽어 changes 를 다시 채운다. 커밋된 파일은 목록에서 빠진다.
+// git 이 없거나 저장소 밖 파일이면 조용히 건너뛴다
+async function collectChanges($: EngineInterface, paths: string[], prev: Change[]): Promise<Change[]> {
+  const roots = new Map<string, string | null>()
+  const byRoot = new Map<string, { path: string; rel: string }[]>()
+  for (const path of paths) {
+    const dir = dirOf(path)
+    if (!roots.has(dir)) {
+      try {
+        const r = await git($, ['-C', dir, 'rev-parse', '--show-toplevel'], 5000)
+        roots.set(dir, r.exitCode === 0 ? normPath(r.stdout.trim()) : null)
+      } catch {
+        roots.set(dir, null)
+      }
+    }
+    const root = roots.get(dir)
+    const rel = root ? relTo(root, path) : null
+    if (!root || !rel) continue
+    byRoot.set(root, [...(byRoot.get(root) ?? []), { path, rel }])
+  }
+
+  const multi = byRoot.size > 1
+  const out: Change[] = []
+  for (const [root, files] of byRoot) {
+    const rels = files.map(f => f.rel)
+    const st = await git($, ['-C', root, 'status', '--porcelain', '-z', '--', ...rels], 10000)
+    if (st.exitCode !== 0) continue
+    const status = parseStatusZ(st.stdout)
+    const ns = await git($, ['-C', root, 'diff', 'HEAD', '--numstat', '-z', '--', ...rels], 10000)
+    const nums = ns.exitCode === 0 ? parseNumstatZ(ns.stdout) : new Map<string, { added: number; removed: number }>()
+    const repo = root.slice(root.lastIndexOf('/') + 1)
+    for (const f of files) {
+      const xy = status.get(f.rel)
+      if (!xy) continue // 커밋됐거나 고친 뒤 원래대로 돌아간 파일
+      let n = nums.get(f.rel)
+      if (!n && xy === '??') {
+        // 추적 전 새 파일은 numstat 에 없어 줄 수를 직접 센다
+        try {
+          n = { added: (await $.fs.read(f.path)).split('\n').length, removed: 0 }
+        } catch {
+          n = undefined
+        }
+      }
+      const old = prev.find(c => c.path === f.path)
+      out.push({
+        path: f.path,
+        name: multi ? `${repo}/${f.rel}` : f.rel,
+        status: statusLabel(xy),
+        added: n?.added ?? 0,
+        removed: n?.removed ?? 0,
+        summary: old?.summary,
+        summaryKey: old?.summaryKey,
+      })
+    }
+  }
+  return out
+}
+
+// 파일 하나의 diff 원문. 추적 전 새 파일은 내용 앞부분을 그대로 쓴다
+async function diffText($: EngineInterface, c: Change): Promise<string> {
+  if (c.status === '새 파일') {
+    try {
+      return (await $.fs.read(c.path)).slice(0, DIFF_INPUT_MAX)
+    } catch {
+      return ''
+    }
+  }
+  const r = await git($, ['-C', dirOf(c.path), 'diff', 'HEAD', '--', c.path], 10000)
+  return r.exitCode === 0 ? r.stdout : ''
+}
+
+// 새로 읽은 목록에 지금 상태의 요약을 옮겨 붙인다. git 을 읽는 사이 요약이 들어왔어도 덮어쓰지 않게 한다
+export function keepSummaries(list: Change[], cur: Change[]): Change[] {
+  return list.map(c => {
+    const o = cur.find(x => x.path === c.path)
+    return o ? { ...c, summary: o.summary, summaryKey: o.summaryKey, summaryError: o.summaryError } : c
+  })
+}
+
+// 미커밋 파일 새로 읽기. 겹쳐 돌지 않게 하나만 돌리고, 도는 중 요청이 오면 끝난 뒤 한 번 더 돈다
+let refreshing = false
+let refreshAgain = false
+async function refreshChanges($: EngineInterface): Promise<void> {
+  if (refreshing) {
+    refreshAgain = true
+    return
+  }
+  refreshing = true
+  try {
+    do {
+      refreshAgain = false
+      const paths = await read($, touched)
+      if (paths.length === 0) continue
+      const list = await collectChanges($, paths, [])
+      await update($, changes, cur => keepSummaries(list, cur))
+    } while (refreshAgain)
+  } catch {
+    // git 실패는 창 표시에 영향 없이 넘어간다
+  } finally {
+    refreshing = false
+  }
+}
+
+// 내용이 바뀐 파일만 모델에게 한 줄 요약을 받는다. session.start 의 타이머에서 부른다.
+// 훅이 끝난 뒤 이어서 부르면 그 dispatch 가 끝나 모델 호출이 aborted 로 돌아올 수 있다(reference.md 「Work that outlives a dispatch」)
+let summarizing = false
+async function summarizeChanges($: EngineInterface): Promise<void> {
+  if (summarizing) return
+  summarizing = true
+  try {
+    for (const c of await read($, changes)) {
+      try {
+        const diff = await diffText($, c)
+        if (diff.trim() === '') continue
+        const key = diffKey(diff)
+        if (c.summaryKey === key) continue
+        const r = await $.model.complete({
+          model: SUMMARY_MODEL,
+          prompt: diffSummaryPrompt(c.name, diff),
+          maxTokens: 200,
+          effort: 'low',
+          timeoutMs: 20000,
+        })
+        if (r.isAnswered) {
+          const summary = cleanSummary(r.text)
+          await update($, changes, list =>
+            list.map(x => (x.path === c.path ? { ...x, summary, summaryKey: key, summaryError: undefined } : x)),
+          )
+        } else {
+          // 실패 이유를 창에 보인다. aborted 는 다음 주기에 다시 시도하고, 그 밖의 실패는 diff 가 바뀔 때까지 다시 부르지 않는다
+          const reason = r.reason
+          await update($, changes, list =>
+            list.map(x =>
+              x.path === c.path ? { ...x, summaryError: reason, summaryKey: reason === 'aborted' ? x.summaryKey : key } : x,
+            ),
+          )
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        await update($, changes, list => list.map(x => (x.path === c.path ? { ...x, summaryError: msg } : x)))
+      }
+    }
+  } finally {
+    summarizing = false
+  }
+}
+
 export const register: Register = on => {
   // 백그라운드로 시작한 에이전트의 tool_use_id. 그 에이전트는 호출이 돌아온 뒤에도 돌고, 완료 알림으로 끝난다
   const backgroundAgents = new Set<string>()
@@ -223,6 +464,13 @@ export const register: Register = on => {
 
     await poll()
     $.clock.every(POLL_MS, poll)
+    // 사용자가 직접 커밋해도 목록에서 빠지게 git 상태를 주기적으로 다시 읽는다
+    // 요약은 요청이 끝나 쉬는 동안에만 만든다. 작업 중에는 diff 가 계속 바뀌어 호출만 늘어난다
+    $.clock.every(CHANGES_POLL_MS, async () => {
+      await refreshChanges($)
+      const req = await read($, request)
+      if (!req || req.endedAt !== null) await summarizeChanges($)
+    })
     void $.ui.open({ id: PANE, title: TITLE })
 
     return next(e)
@@ -290,18 +538,35 @@ export const register: Register = on => {
     if (!e.agentId) {
       const t = await $.clock.now()
       await update($, request, r => (r && r.endedAt === null ? { ...r, endedAt: t } : r))
+      // 턴 끝을 늦추지 않게 기다리지 않는다. 요약은 session.start 의 타이머가 만든다
+      void refreshChanges($)
     }
     return next(e)
   })
 
   // 서브에이전트(전경, 백그라운드)와 백그라운드 셸 명령, 실패한 셸 명령
   on('tool.call', async ($, e, next) => {
-    if (e.agentId) return next(e)
     const args = e as unknown as Record<string, unknown>
+    // 이 세션에서 고친 파일을 기록한다. 서브에이전트가 고친 것도 포함한다
+    const editKey = EDIT_TOOLS[e.tool]
+    if (editKey) {
+      const ran = await next(e)
+      const ok = !('deny' in ran) && !('isError' in ran && ran.isError === true)
+      const target = args[editKey]
+      if (ok && typeof target === 'string') {
+        const path = normPath(target)
+        await update($, touched, list => (list.includes(path) ? list : [...list, path]))
+        void refreshChanges($)
+      }
+      return ran
+    }
+    if (e.agentId) return next(e)
     const isAgent = e.tool === 'Agent'
     const isShell = e.tool === 'Bash' || e.tool === 'PowerShell'
     if (isShell && args.run_in_background !== true) {
       const ran = await next(e)
+      // 셸 명령으로 커밋했을 수 있어 미커밋 목록을 다시 읽는다
+      void refreshChanges($)
       if ('isError' in ran && ran.isError === true) {
         const command = typeof args.command === 'string' ? args.command : ''
         const label = typeof args.description === 'string' && args.description ? args.description : oneLine(command, 80)
@@ -347,6 +612,7 @@ export const register: Register = on => {
     const req = await read($, request)
     const list = await read($, jobs)
     const fails = await read($, failures)
+    const changed = await read($, changes)
     const failTotal = fails.reduce((s, f) => s + f.count, 0)
     const width = Math.max(6, Math.min(20, (e.props.bodyColumns ?? 40) - 22))
     const textMax = Math.max(20, (e.props.bodyColumns ?? 40) - 4)
@@ -422,6 +688,34 @@ export const register: Register = on => {
           </Box>
         ) : (
           <Text dimColor>아직 없음</Text>
+        )}
+
+        {/* 이 세션에서 고쳤고 아직 커밋하지 않은 파일. 있을 때만 보인다 */}
+        {changed.length > 0 && (
+          <Box flexDirection="column">
+            <Text> </Text>
+            <Text bold color="warning">미커밋 파일 {changed.length}개</Text>
+            {changed.map(c => (
+              <Box flexDirection="column">
+                <Text wrap="wrap">
+                  ● {c.name}{'  '}
+                  <Text dimColor>
+                    {c.status} +{c.added} -{c.removed}
+                  </Text>
+                </Text>
+                <Text dimColor wrap="wrap">
+                  {'  '}
+                  {typeof c.summary === 'string'
+                    ? c.summary
+                    : c.summaryError
+                      ? `요약 실패: ${c.summaryError}`
+                      : req && req.endedAt === null
+                        ? '요청이 끝나면 요약'
+                        : '요약 중…'}
+                </Text>
+              </Box>
+            ))}
+          </Box>
         )}
 
         {/* 실패한 명령은 있을 때만 보인다. 같은 명령이 여러 번 실패하면 횟수가 오른다 */}

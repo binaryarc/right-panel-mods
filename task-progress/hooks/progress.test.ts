@@ -23,6 +23,15 @@ import {
   staleFiles,
   TTL_MS,
   trimJobs,
+  dirOf,
+  diffKey,
+  diffSummaryPrompt,
+  keepSummaries,
+  normPath,
+  parseNumstatZ,
+  parseStatusZ,
+  relTo,
+  statusLabel,
 } from './register'
 
 test('진행률 기본값: done 100, next 0', () => {
@@ -158,4 +167,48 @@ test('실패한 명령: 같은 명령은 횟수를 올리고 최근 5개만 남�
   expect(list.map(x => `${x.command}${x.count}`)).toEqual(['b1', 'a2'])
   for (const c of ['c', 'd', 'e', 'g']) list = addFailure(list, f(c, 4))
   expect(list.map(x => x.command)).toEqual(['a', 'c', 'd', 'e', 'g'])
+})
+
+test('경로: 역슬래시를 슬래시로, 폴더, 저장소 기준 상대경로(대소문자 무시)', () => {
+  expect(normPath('C:\\a\\b\\c.ts')).toBe('C:/a/b/c.ts')
+  expect(dirOf('C:\\a\\b\\c.ts')).toBe('C:/a/b')
+  expect(relTo('C:/repo', 'c:/Repo/src/x.ts')).toBe('src/x.ts')
+  expect(relTo('C:/repo', 'C:/repo2/x.ts')).toBe(null)
+})
+
+test('git status -z: 상태 두 글자, 이름 변경은 원래 경로를 건너뛴다', () => {
+  const m = parseStatusZ(' M a.ts\0?? 새 파일.md\0R  new.ts\0old.ts\0D  gone.ts\0')
+  expect(m.get('a.ts')).toBe(' M')
+  expect(m.get('새 파일.md')).toBe('??')
+  expect(m.get('new.ts')).toBe('R ')
+  expect(m.has('old.ts')).toBe(false)
+  expect(statusLabel('??')).toBe('새 파일')
+  expect(statusLabel('A ')).toBe('새 파일')
+  expect(statusLabel(' D')).toBe('삭제')
+  expect(statusLabel('R ')).toBe('이름 변경')
+  expect(statusLabel('MM')).toBe('수정')
+})
+
+test('git diff --numstat -z: 추가, 삭제 줄 수. 바이너리는 0', () => {
+  const m = parseNumstatZ('12\t3\ta.ts\0-\t-\timg.png\0')
+  expect(m.get('a.ts')).toEqual({ added: 12, removed: 3 })
+  expect(m.get('img.png')).toEqual({ added: 0, removed: 0 })
+})
+
+test('diff 지문은 내용이 바뀌면 달라지고, 요약 질문은 diff 를 태그로 감싼다', () => {
+  expect(diffKey('+a')).toBe(diffKey('+a'))
+  expect(diffKey('+a')).not.toBe(diffKey('+b'))
+  const p = diffSummaryPrompt('a.ts', '+x')
+  expect(p.includes('<diff>\n+x\n</diff>')).toBe(true)
+  expect(diffSummaryPrompt('a.ts', 'x'.repeat(9000)).includes('x'.repeat(4001))).toBe(false)
+})
+
+test('git 을 다시 읽어도 그 사이 들어온 요약은 덮어쓰지 않는다', () => {
+  const base = { path: 'C:/r/a.ts', name: 'a.ts', status: '수정', added: 1, removed: 0 }
+  const cur = [{ ...base, summary: '함수 추가', summaryKey: 'k1' }]
+  const fresh = [{ ...base, added: 3 }, { ...base, path: 'C:/r/b.ts', name: 'b.ts' }]
+  const out = keepSummaries(fresh, cur)
+  expect(out[0]?.summary).toBe('함수 추가')
+  expect(out[0]?.added).toBe(3)
+  expect(out[1]?.summary).toBe(undefined)
 })

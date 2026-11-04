@@ -52,6 +52,24 @@ export type Failure = {
   error: string
 }
 
+/** 이 세션에서 고쳤고 아직 커밋하지 않은 파일. git 상태로 채운다 */
+export type Change = {
+  /** 파일 절대경로(슬래시). 같은 파일인지 가르는 기준 */
+  path: string
+  /** 창에 보일 이름. 저장소 루트 기준 상대경로 */
+  name: string
+  /** 수정, 새 파일, 삭제, 이름 변경 */
+  status: string
+  added: number
+  removed: number
+  /** 바뀐 내용을 모델이 한 줄로 적은 것. undefined 는 아직 없음, null 은 실패 */
+  summary?: string | null
+  /** summary 를 만든 diff 의 지문. 바뀌면 다시 요약한다 */
+  summaryKey?: string
+  /** 요약에 실패한 이유. 창에 그대로 보인다 */
+  summaryError?: string
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'task-progress': {
@@ -63,6 +81,9 @@ declare module 'claude-code' {
       request: Request | null
       jobs: Job[]
       failures: Failure[]
+      /** 이 세션에서 Write, Edit, NotebookEdit 로 고친 파일 절대경로(역슬래시는 슬래시로 바꿔 둔다) */
+      touched: string[]
+      changes: Change[]
     }
   }
 }
