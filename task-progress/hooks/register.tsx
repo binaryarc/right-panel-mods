@@ -1,14 +1,21 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Change, Failure, Job, Progress, Request, Task } from '../types'
+import type { Change, Failure, Job, Progress, Request, Task, TaskTrack } from '../types'
+import { changeKind, diffSummaryPrompt as diffPrompt, fileNotice as notice, pickLang, STRINGS, summaryPrompt as reqPrompt } from './i18n'
+import type { Lang, Strings } from './i18n'
 
 // 진행 상황 파일 폴더. 세션마다 {세션ID}.json 하나를 Claude 가 적는다(선택)
 // PC 마다 사용자 폴더가 달라 session.start 에서 환경변수로 정한다
 let dir = ''
 const PANE = 'task-progress'
-const TITLE = '작업 진행'
 const POLL_MS = 2000
+// 진행 중 단계가 남은 채 이 시간 넘게 고쳐지지 않은 파일은 버려진 것으로 보고 숨긴다
+export const STALE_MS = 30 * 60 * 1000
+// 비례 계산에 쓸 최소 경과 시간. 이보다 짧으면 percent 하나로 남은 시간을 잡기에 근거가 약하다
+const MIN_ELAPSED_MS = 5000
+// Windows 지역 설정을 한 번 읽어 저장해 두는 파일. 세션마다 PowerShell 을 띄우지 않으려고 둔다
+const CULTURE_FILE = '.culture'
 const KEEP_DONE_JOBS = 5
 const KEEP_FAILURES = 5
 // 세션별 진행 파일 보관 기간. 마지막 수정 뒤 이 기간이 지나면 다음 세션 시작 때 지운다
@@ -24,27 +31,103 @@ const jobs = atom({ plugin: 'task-progress', key: 'jobs' } as const, [])
 const failures = atom({ plugin: 'task-progress', key: 'failures' } as const, [])
 const touched = atom({ plugin: 'task-progress', key: 'touched' } as const, [])
 const changes = atom({ plugin: 'task-progress', key: 'changes' } as const, [])
+const track = atom({ plugin: 'task-progress', key: 'track' } as const, {})
+const lang = atom({ plugin: 'task-progress', key: 'lang' } as const, 'en')
 
 export function percentOf(t: Task): number {
   if (typeof t.percent === 'number') return Math.max(0, Math.min(100, t.percent))
   return t.status === 'done' ? 100 : 0
 }
 
-// 남은 초. etaSec 가 있으면 그 값, 없으면 경과시간과 진행률로 비례 계산
-export function remainingSec(t: Task, nowMs: number): number | null {
-  if (t.status === 'done') return 0
-  if (typeof t.etaSec === 'number') return Math.max(0, t.etaSec)
-  const p = percentOf(t)
-  if (t.status !== 'running' || typeof t.startedAt !== 'number' || p <= 0) return null
-  const elapsed = (nowMs - t.startedAt) / 1000
-  return Math.max(0, (elapsed * (100 - p)) / p)
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v))
 }
 
-export function fmtSec(s: number | null): string {
-  if (s === null) return '계산 중'
-  if (s < 60) return `${Math.round(s)}초`
+export function trackKey(title: string | undefined, name: string): string {
+  return `${title ?? ''}\n${name}`
+}
+
+// 단계별 남은 시간 기록을 갱신한다. 파일이 바뀔 때마다 부른다.
+// Claude 가 적는 startedAt 은 어림한 값이 많아(며칠, 몇 달 전 시각) 그대로 쓰지 않는다.
+// 모드가 단계를 running 으로 처음 본 파일 수정 시각을 시작으로 삼고, Claude 값은 지금 요청 시작과 그 시각 사이로 묶는다.
+// 남은 시간은 percent, etaSec 가 바뀐 그 순간 한 번 잡고 그 뒤로는 줄여 간다.
+// 경과시간으로 매번 다시 나누면 percent 가 낡았을 때 남은 시간이 계속 불어난다
+export function trackTasks(
+  prev: Record<string, TaskTrack>,
+  p: Progress | null,
+  mtime: number,
+  reqStart: number | null,
+): Record<string, TaskTrack> {
+  if (!p) return prev
+  const out: Record<string, TaskTrack> = {}
+  for (const t of p.tasks) {
+    const key = trackKey(p.title, t.name)
+    const old = prev[key]
+    const eta = typeof t.etaSec === 'number' && t.etaSec >= 0 ? t.etaSec : null
+    if (t.status !== 'running') {
+      // next 단계의 etaSec 는 running 이 됐을 때 첫 예상으로 쓴다
+      out[key] = { plan: t.status === 'next' ? eta : (old?.plan ?? null), startAt: null, pct: 0, eta: null, est: null, estAt: 0 }
+      continue
+    }
+    const pct = percentOf(t)
+    if (!old || old.startAt === null) {
+      const lo = reqStart !== null && reqStart <= mtime ? reqStart : mtime
+      const startAt = typeof t.startedAt === 'number' ? clamp(t.startedAt, lo, mtime) : mtime
+      const elapsed = mtime - startAt
+      const prop = pct > 0 && elapsed >= MIN_ELAPSED_MS ? (elapsed / 1000) * ((100 - pct) / pct) : null
+      out[key] = { plan: old?.plan ?? null, startAt, pct, eta, est: eta ?? prop ?? old?.plan ?? null, estAt: mtime }
+      continue
+    }
+    if (pct === old.pct && eta === old.eta) {
+      out[key] = old
+      continue
+    }
+    // etaSec 를 새로 적었으면 그 값, percent 만 바뀌었으면 지금까지 걸린 시간으로 비례 계산
+    const elapsed = mtime - old.startAt
+    let est = old.est
+    let estAt = old.estAt
+    if (eta !== old.eta && eta !== null) {
+      est = eta
+      estAt = mtime
+    } else if (pct > 0 && pct < 100 && elapsed >= MIN_ELAPSED_MS) {
+      est = (elapsed / 1000) * ((100 - pct) / pct)
+      estAt = mtime
+    } else if (pct >= 100) {
+      est = 0
+      estAt = mtime
+    }
+    out[key] = { ...old, pct, eta, est, estAt }
+  }
+  return out
+}
+
+// 남은 초. null 은 아직 모름. running 은 마지막으로 잡은 예상에서 그 뒤 흐른 시간을 뺀다
+export function remainingSec(t: Task, tr: TaskTrack | undefined, nowMs: number): number | null {
+  if (t.status === 'done') return 0
+  if (t.status === 'next') return typeof t.etaSec === 'number' ? Math.max(0, t.etaSec) : null
+  if (!tr || tr.est === null) return null
+  return Math.max(0, tr.est - (nowMs - tr.estAt) / 1000)
+}
+
+// 남은 시간 합계. 모르는 단계가 있으면 아는 것만 더해 「이상」을 붙인다
+export function totalRemaining(list: (number | null)[]): { sec: number | null; partial: boolean } {
+  const known = list.filter((s): s is number => s !== null)
+  if (known.length === 0) return { sec: list.length === 0 ? 0 : null, partial: false }
+  return { sec: known.reduce((a, b) => a + b, 0), partial: known.length < list.length }
+}
+
+export function fmtSec(s: number | null, S: Strings = STRINGS.ko): string {
+  if (s === null) return S.calculating
+  if (s < 60) return S.seconds(Math.round(s))
   const m = Math.round(s / 60)
-  return m < 60 ? `약 ${m}분` : `약 ${Math.floor(m / 60)}시간 ${m % 60}분`
+  return m < 60 ? S.minutes(m) : S.hours(Math.floor(m / 60), m % 60)
+}
+
+// 진행 중 단계의 남은 시간. 예상이 다 줄어 0 이 되면 「곧 완료」
+export function fmtLeft(s: number | null, S: Strings = STRINGS.ko, partial = false): string {
+  if (s !== null && s < 1 && !partial) return S.almostDone
+  const text = fmtSec(s, S)
+  return partial ? S.atLeast(text) : text
 }
 
 // 경과 시간 m:ss (1시간 넘으면 h:mm:ss)
@@ -115,16 +198,9 @@ export function progressFile(folder: string, sessionId: string): string {
 }
 
 // Claude 에게 이 세션이 쓸 파일 경로와 쓰는 법을 알리는 안내문. 사용자 메시지마다 덧붙인다.
-// 규칙을 여기 담아 두면 PC 마다 CLAUDE.md 를 고치지 않아도 된다
-export function fileNotice(path: string): string {
-  return [
-    `작업 진행 창 파일: 이 세션의 진행 상황 파일 경로는 ${path} 이다. 다른 세션의 파일을 읽거나 쓰지 않는다.`,
-    '단계가 2개 이상이거나 5분 넘게 걸릴 작업이면 이 파일을 쓴다. 짧은 질문 답변, 한 단계로 끝나는 작업에는 쓰지 않는다.',
-    '형식: {"title": "...", "tasks": [{"name": "...", "status": "done|running|next", "percent": 0~100, "startedAt": epoch ms, "etaSec": 초, "note": "..."}]}. name, status 만 필수다.',
-    '작업 시작 때 전체 단계를 적고, 단계가 시작되거나 끝날 때마다 파일을 통째로 다시 쓴다. 마지막 단계가 끝나면 모두 done 으로 바꾼다.',
-    'running 단계에는 startedAt, percent 를 넣고 etaSec 는 넣지 않는다(창이 남은 시간을 계산한다). 긴 단계는 도는 중에도 percent, note 를 고쳐 쓴다. etaSec 는 next 단계에만 넣는다.',
-    '답변에서 이 파일 갱신을 따로 언급하지 않는다.',
-  ].join(' ')
+// 규칙을 여기 담아 두면 PC 마다 CLAUDE.md 를 고치지 않아도 된다. 문구는 i18n.ts 에 있다
+export function fileNotice(path: string, l: Lang = 'ko'): string {
+  return notice(path, l)
 }
 
 // 현재 요청을 해석할 모델과 입력 길이 상한
@@ -132,13 +208,8 @@ const SUMMARY_MODEL = 'haiku'
 const SUMMARY_INPUT_MAX = 2000
 
 // 사용자 요청을 해석해 한 줄로 적게 하는 질문. 요청 원문은 태그로 감싸 지시와 분리한다
-export function summaryPrompt(text: string): string {
-  return [
-    '아래 <request> 는 사용자가 코딩 도우미에게 보낸 요청이다. 사용자가 실제로 무엇을 원하는지 해석해 한국어 한 문장으로 적어라.',
-    '원문을 그대로 옮기지 말고, 오타와 줄임말을 바로잡아 할 일이 드러나게 쓴다. 40자 안팎, "~하기" 나 "~ 확인" 처럼 명사형으로 끝낸다.',
-    '답은 그 문장 하나만 쓴다. 따옴표, 머리말, 설명을 붙이지 않는다.',
-    `<request>\n${text.slice(0, SUMMARY_INPUT_MAX)}\n</request>`,
-  ].join('\n')
+export function summaryPrompt(text: string, l: Lang = 'ko'): string {
+  return reqPrompt(text, l, SUMMARY_INPUT_MAX)
 }
 
 // 모델 답에서 첫 줄만 쓰고 감싼 따옴표를 뗀다. 비었으면 null
@@ -148,9 +219,9 @@ export function cleanSummary(reply: string): string | null {
 }
 
 // 창에 보일 현재 요청 문구: 해석한 문장, 해석 중이면 안내, 실패했으면 원문
-export function requestLabel(req: Request): string {
+export function requestLabel(req: Request, S: Strings = STRINGS.ko): string {
   if (typeof req.summary === 'string') return req.summary
-  return req.summary === null ? req.text : '요청 해석 중…'
+  return req.summary === null ? req.text : S.interpreting
 }
 
 // 도구 호출이 백그라운드로 돌았는지. 에이전트는 호출 인자에 run_in_background 가 없어
@@ -166,11 +237,12 @@ export function staleFiles(files: { name: string; mtimeMs: number }[], nowMs: nu
     .map(f => f.name)
 }
 
-// 진행 상황 파일을 보여줄지: 지금 요청 중에 고쳐졌거나 진행 중 단계가 있을 때만
-export function showFile(p: Progress | null, mtime: number, req: Request | null): boolean {
+// 진행 상황 파일을 보여줄지: 지금 요청 중에 고쳐졌거나, 진행 중 단계가 있고 최근에 고쳐졌을 때만.
+// 진행 중 단계를 닫지 않고 끝난 파일은 오래 고쳐지지 않으면 숨긴다. 남겨 두면 다음 요청 내내 낡은 단계가 보인다
+export function showFile(p: Progress | null, mtime: number, req: Request | null, nowMs: number): boolean {
   if (!p || p.tasks.length === 0) return false
-  if (!req) return true
-  return mtime >= req.startedAt || p.tasks.some(t => t.status === 'running')
+  if (req && mtime >= req.startedAt) return true
+  return p.tasks.some(t => t.status === 'running') && nowMs - mtime < STALE_MS
 }
 
 // 파일 지우기. $.fs 에 삭제가 없어 PowerShell 로 지운다.
@@ -234,11 +306,12 @@ export function parseNumstatZ(out: string): Map<string, { added: number; removed
   return map
 }
 
+// git 상태 두 글자를 상태 코드로. 창에는 언어에 맞는 문구로 바꿔 보인다
 export function statusLabel(xy: string): string {
-  if (xy === '??' || xy.includes('A')) return '새 파일'
-  if (xy.includes('D')) return '삭제'
-  if (xy.includes('R')) return '이름 변경'
-  return '수정'
+  if (xy === '??' || xy.includes('A')) return 'new'
+  if (xy.includes('D')) return 'deleted'
+  if (xy.includes('R')) return 'renamed'
+  return 'modified'
 }
 
 // diff 지문. 요약을 다시 만들지 가르는 값이라 짧고 내용이 바뀌면 달라지면 된다
@@ -249,12 +322,8 @@ export function diffKey(text: string): string {
 }
 
 // 바뀐 내용을 한 줄로 적게 하는 질문. diff 원문은 태그로 감싸 지시와 분리한다
-export function diffSummaryPrompt(name: string, diff: string): string {
-  return [
-    `아래 <diff> 는 파일 ${name} 의 아직 커밋하지 않은 변경이다. 무엇을 바꿨는지 한국어 한 문장으로 적어라.`,
-    '30자 안팎, "~ 추가", "~ 수정" 처럼 명사형으로 끝낸다. 답은 그 문장 하나만 쓴다. 따옴표, 머리말을 붙이지 않는다.',
-    `<diff>\n${diff.slice(0, DIFF_INPUT_MAX)}\n</diff>`,
-  ].join('\n')
+export function diffSummaryPrompt(name: string, diff: string, l: Lang = 'ko'): string {
+  return diffPrompt(name, diff, l, DIFF_INPUT_MAX)
 }
 
 // git 실행. 먼저 PATH 의 git 을 쓰고, 못 띄우면 ProgramFiles 아래 Git for Windows 를 쓴다.
@@ -337,7 +406,7 @@ async function collectChanges($: EngineInterface, paths: string[], prev: Change[
 
 // 파일 하나의 diff 원문. 추적 전 새 파일은 내용 앞부분을 그대로 쓴다
 async function diffText($: EngineInterface, c: Change): Promise<string> {
-  if (c.status === '새 파일') {
+  if (changeKind(c.status) === 'new') {
     try {
       return (await $.fs.read(c.path)).slice(0, DIFF_INPUT_MAX)
     } catch {
@@ -387,15 +456,17 @@ async function summarizeChanges($: EngineInterface): Promise<void> {
   if (summarizing) return
   summarizing = true
   try {
+    const l = await read($, lang)
     for (const c of await read($, changes)) {
       try {
         const diff = await diffText($, c)
         if (diff.trim() === '') continue
-        const key = diffKey(diff)
+        // 언어가 바뀌면 같은 diff 라도 다시 요약한다
+        const key = `${l}:${diffKey(diff)}`
         if (c.summaryKey === key) continue
         const r = await $.model.complete({
           model: SUMMARY_MODEL,
-          prompt: diffSummaryPrompt(c.name, diff),
+          prompt: diffSummaryPrompt(c.name, diff, l),
           maxTokens: 200,
           effort: 'low',
           timeoutMs: 20000,
@@ -424,21 +495,59 @@ async function summarizeChanges($: EngineInterface): Promise<void> {
   }
 }
 
-export const register: Register = on => {
+// Windows 지역 설정 이름(ko-KR 등). 처음 한 번 PowerShell 로 읽어 진행 폴더에 적어 두고, 다음부터는 그 파일을 읽는다.
+// Windows 가 아니거나 읽지 못하면 undefined
+async function windowsCulture($: EngineInterface): Promise<string | undefined> {
+  const cache = `${dir}/${CULTURE_FILE}`
+  try {
+    if (await $.fs.exists(cache)) return (await $.fs.read(cache)).trim() || undefined
+    if (!(await $.env.get('USERPROFILE')) || !(await $.fs.exists(POWERSHELL))) return undefined
+    const r = await $.process.run([POWERSHELL, '-NoProfile', '-Command', '(Get-Culture).Name'], { timeoutMs: 5000 })
+    const name = r.exitCode === 0 ? r.stdout.trim() : ''
+    if (name) await $.fs.write(cache, name)
+    return name || undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function detectLang($: EngineInterface, option: unknown): Promise<Lang> {
+  const opt = typeof option === 'string' ? option : undefined
+  if (opt === 'ko' || opt === 'en') return opt
+  let setting: unknown
+  try {
+    setting = await $.settings.read({ key: 'language' })
+  } catch {
+    setting = undefined
+  }
+  const envLocale = (await $.env.get('LC_ALL')) || (await $.env.get('LC_MESSAGES')) || (await $.env.get('LANG'))
+  // 앞 단계에서 정해지면 PowerShell 을 띄우지 않는다
+  const decided = pickLang(opt, setting, envLocale, undefined)
+  if ((typeof setting === 'string' && setting.trim() !== '') || (envLocale && !/^(C|POSIX)(\.|$)/.test(envLocale))) return decided
+  return pickLang(opt, setting, envLocale, await windowsCulture($))
+}
+
+export const register: Register = (on, options) => {
   // 백그라운드로 시작한 에이전트의 tool_use_id. 그 에이전트는 호출이 돌아온 뒤에도 돌고, 완료 알림으로 끝난다
   const backgroundAgents = new Set<string>()
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'progress', description: '작업 진행 창 열기' })
     dir = progressDir(await $.env.get('USERPROFILE'), await $.env.get('HOME'))
+    const l = await detectLang($, options?.language)
+    await update($, lang, () => l)
+    const S = STRINGS[l]
+    await $.command.register({ name: 'progress', description: S.commandDesc })
 
     const poll = async () => {
       try {
         const file = progressFile(dir, await $.session.id())
         const st = await $.fs.stat(file)
         const parsed = JSON.parse(await $.fs.read(file)) as Progress
-        await update($, data, () => (Array.isArray(parsed?.tasks) ? parsed : null))
+        const p = Array.isArray(parsed?.tasks) ? parsed : null
+        const req = await read($, request)
+        await update($, data, () => p)
         await update($, fileTime, () => st.mtimeMs)
+        await update($, track, prev => trackTasks(prev, p, st.mtimeMs, req ? req.startedAt : null))
         await update($, error, () => null)
       } catch (err) {
         await update($, data, () => null)
@@ -471,7 +580,7 @@ export const register: Register = on => {
       const req = await read($, request)
       if (!req || req.endedAt !== null) await summarizeChanges($)
     })
-    void $.ui.open({ id: PANE, title: TITLE })
+    void $.ui.open({ id: PANE, title: S.title })
 
     return next(e)
   })
@@ -490,8 +599,9 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'progress' }, async $ => {
-    await $.ui.open({ id: PANE, title: TITLE })
-    return { text: '작업 진행 창을 열었습니다.' }
+    const S = STRINGS[await read($, lang)]
+    await $.ui.open({ id: PANE, title: S.title })
+    return { text: S.commandReply }
   })
 
   // 사용자 요청과 백그라운드 완료 알림
@@ -511,9 +621,10 @@ export const register: Register = on => {
       await update($, request, () => ({ text: firstLine(e.text), summary: undefined, startedAt: t, endedAt: null }))
       await update($, jobs, list => trimJobs(list))
       await update($, failures, () => [])
+      const l = await read($, lang)
       // 요청 해석은 기다리지 않는다. 메시지 전송을 늦추지 않고, 답이 오면 창만 다시 그린다
       void $.model
-        .complete({ model: SUMMARY_MODEL, prompt: summaryPrompt(e.text), maxTokens: 200, effort: 'low', timeoutMs: 15000 })
+        .complete({ model: SUMMARY_MODEL, prompt: summaryPrompt(e.text, l), maxTokens: 200, effort: 'low', timeoutMs: 15000 })
         .then(r => (r.isAnswered ? cleanSummary(r.text) : null))
         .catch(() => null)
         .then(summary =>
@@ -523,7 +634,7 @@ export const register: Register = on => {
         .catch(() => undefined)
       // 사용자 메시지마다 이 세션의 진행 파일 경로를 붙인다.
       // 시스템 프롬프트 절(prompt.compose)은 Claude 에게 보이지 않아 쓰지 않는다(2026-10-12 확인)
-      const ctx = fileNotice(progressFile(dir, await $.session.id()))
+      const ctx = fileNotice(progressFile(dir, await $.session.id()), l)
       return next({ ...e, context: [...(e.context ?? []), ctx] })
     }
     return next(e)
@@ -613,21 +724,23 @@ export const register: Register = on => {
     const list = await read($, jobs)
     const fails = await read($, failures)
     const changed = await read($, changes)
+    const tracked = await read($, track)
+    const S = STRINGS[await read($, lang)]
     const failTotal = fails.reduce((s, f) => s + f.count, 0)
     const width = Math.max(6, Math.min(20, (e.props.bodyColumns ?? 40) - 22))
     const textMax = Math.max(20, (e.props.bodyColumns ?? 40) - 4)
 
     const running = list.filter(j => j.endedAt === null)
     const finished = list.filter(j => j.endedAt !== null)
-    const file = showFile(p, mtime, req) ? p : null
+    const file = showFile(p, mtime, req, nowMs) ? p : null
 
     const current = file ? file.tasks.filter(t => t.status !== 'next') : []
     const upcoming = file ? file.tasks.filter(t => t.status === 'next') : []
     const overall = file && file.tasks.length
       ? Math.round(file.tasks.reduce((s, t) => s + percentOf(t), 0) / file.tasks.length)
       : 0
-    const left = file ? file.tasks.filter(t => t.status !== 'done').map(t => remainingSec(t, nowMs)) : []
-    const totalLeft = left.some(s => s === null) ? null : left.reduce((a, b) => a! + b!, 0)
+    const leftOf = (t: Task) => remainingSec(t, file ? tracked[trackKey(file.title, t.name)] : undefined, nowMs)
+    const total = totalRemaining(file ? file.tasks.filter(t => t.status !== 'done').map(leftOf) : [])
 
     return (
       <Box flexDirection="column">
@@ -636,9 +749,11 @@ export const register: Register = on => {
           <Box flexDirection="column">
             {file.title && <Text bold>{oneLine(file.title, textMax)}</Text>}
             <Text>
-              전체 {bar(overall, width)} {overall}%
+              {S.overall} {bar(overall, width)} {overall}%
             </Text>
-            <Text dimColor>남은 시간 {fmtSec(totalLeft)}</Text>
+            <Text dimColor>
+              {S.timeLeft} {fmtLeft(total.sec, S, total.partial)}
+            </Text>
             {current.map(t => (
               <Box flexDirection="column">
                 <Text bold={t.status === 'running'} dimColor={t.status === 'done'}>
@@ -647,7 +762,7 @@ export const register: Register = on => {
                 <Text dimColor={t.status === 'done'}>
                   {'  '}
                   {bar(percentOf(t), width)} {percentOf(t)}%
-                  {t.status === 'running' ? `  남은 ${fmtSec(remainingSec(t, nowMs))}` : ''}
+                  {t.status === 'running' ? `  ${S.left} ${fmtLeft(leftOf(t), S)}` : ''}
                 </Text>
                 {t.note && <Text dimColor>{'  '}{oneLine(t.note, textMax - 2)}</Text>}
               </Box>
@@ -655,13 +770,13 @@ export const register: Register = on => {
             {upcoming.length > 0 && (
               <Box flexDirection="column">
                 <Text> </Text>
-                <Text bold>▼ 다음 작업</Text>
+                <Text bold>▼ {S.nextSteps}</Text>
                 {upcoming.map((t, i) => (
                   <Box flexDirection="column">
                     <Text>
                       {'  '}
                       {oneLine(t.name, textMax - 2)}
-                      {typeof t.etaSec === 'number' ? `  (${fmtSec(t.etaSec)})` : ''}
+                      {typeof t.etaSec === 'number' ? `  (${fmtSec(t.etaSec, S)})` : ''}
                     </Text>
                     {i < upcoming.length - 1 && <Text dimColor>{'    ↓'}</Text>}
                   </Box>
@@ -672,35 +787,35 @@ export const register: Register = on => {
           </Box>
         )}
 
-        <Text bold>현재 요청</Text>
+        <Text bold>{S.currentRequest}</Text>
         {req ? (
           <Box flexDirection="column">
             {/* 현재 요청은 자르지 않고 창 폭에서 줄을 바꿔 전부 보여준다 */}
             <Text dimColor={req.endedAt !== null} wrap="wrap">
-              {req.endedAt === null ? '▶' : '✔'} {firstLine(requestLabel(req))}
+              {req.endedAt === null ? '▶' : '✔'} {firstLine(requestLabel(req, S))}
             </Text>
             <Text dimColor>
               {'  '}
               {req.endedAt === null
-                ? `진행 ${fmtElapsed(nowMs - req.startedAt)}`
-                : `완료 (${fmtElapsed(req.endedAt - req.startedAt)})`}
+                ? S.running(fmtElapsed(nowMs - req.startedAt))
+                : S.finished(fmtElapsed(req.endedAt - req.startedAt))}
             </Text>
           </Box>
         ) : (
-          <Text dimColor>아직 없음</Text>
+          <Text dimColor>{S.noneYet}</Text>
         )}
 
         {/* 이 세션에서 고쳤고 아직 커밋하지 않은 파일. 있을 때만 보인다 */}
         {changed.length > 0 && (
           <Box flexDirection="column">
             <Text> </Text>
-            <Text bold color="warning">미커밋 파일 {changed.length}개</Text>
+            <Text bold color="warning">{S.uncommitted(changed.length)}</Text>
             {changed.map(c => (
               <Box flexDirection="column">
                 <Text wrap="wrap">
                   ● {c.name}{'  '}
                   <Text dimColor>
-                    {c.status} +{c.added} -{c.removed}
+                    {S.change[changeKind(c.status)]} +{c.added} -{c.removed}
                   </Text>
                 </Text>
                 <Text dimColor wrap="wrap">
@@ -708,10 +823,10 @@ export const register: Register = on => {
                   {typeof c.summary === 'string'
                     ? c.summary
                     : c.summaryError
-                      ? `요약 실패: ${c.summaryError}`
+                      ? S.summaryFailed(c.summaryError)
                       : req && req.endedAt === null
-                        ? '요청이 끝나면 요약'
-                        : '요약 중…'}
+                        ? S.summaryAfterRequest
+                        : S.summarizing}
                 </Text>
               </Box>
             ))}
@@ -722,11 +837,11 @@ export const register: Register = on => {
         {fails.length > 0 && (
           <Box flexDirection="column">
             <Text> </Text>
-            <Text bold color="error">실패한 명령 {failTotal}회</Text>
+            <Text bold color="error">{S.failed(failTotal)}</Text>
             {fails.map(f => (
               <Box flexDirection="column">
                 <Text color={f.count > 1 ? 'error' : undefined}>
-                  ✘ {f.count}회 {oneLine(f.label, textMax - 6)}
+                  ✘ {S.times(f.count)} {oneLine(f.label, textMax - 6)}
                 </Text>
                 {f.error && <Text dimColor>{'  '}{oneLine(f.error, textMax - 2)}</Text>}
               </Box>
@@ -735,11 +850,11 @@ export const register: Register = on => {
         )}
 
         <Text> </Text>
-        <Text bold>백그라운드 작업</Text>
-        {list.length === 0 && <Text dimColor>없음</Text>}
+        <Text bold>{S.background}</Text>
+        {list.length === 0 && <Text dimColor>{S.none}</Text>}
         {running.map(j => (
           <Text>
-            ▶ {j.kind === 'agent' ? '에이전트' : '명령'} {oneLine(j.label, textMax - 18)}  {fmtElapsed(nowMs - j.startedAt)}
+            ▶ {j.kind === 'agent' ? S.agent : S.command} {oneLine(j.label, textMax - 18)}  {fmtElapsed(nowMs - j.startedAt)}
           </Text>
         ))}
         {finished.map(j => (

@@ -1,6 +1,6 @@
 {
   "name": "right-panel-mods",
-  "description": "Claude Code 오른쪽 패널 모드 모음",
+  "description": "Right-side pane mods for Claude Code (Claude Code 오른쪽 패널 모드 모음)",
   "owner": {
     "name": "binaryarc"
   },
@@ -8,7 +8,7 @@
     {
       "name": "task-progress",
       "source": "./task-progress",
-      "description": "진행 중인 작업의 진행률, 예상 남은 시간과 다음 작업을 오른쪽 창에 보여준다"
+      "description": "Shows progress, time left and next steps of the current task in a right-side pane (English, 한국어)"
     }
   ]
 }

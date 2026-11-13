@@ -1,9 +1,19 @@
 {
   "name": "task-progress",
-  "version": "0.7.0",
-  "description": "진행 중인 작업의 진행률, 예상 남은 시간과 다음 작업을 오른쪽 창에 보여준다",
+  "version": "0.8.0",
+  "description": "Shows progress, time left and next steps of the current task in a right-side pane (English, 한국어)",
   "author": {
     "name": "binaryarc"
   },
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Language of the pane and of the instructions sent to Claude. \"auto\" (default) follows Claude Code's language setting, then LC_ALL/LANG, then the Windows region. 창과 Claude 안내문 언어. auto 는 Claude Code language 설정, LC_ALL/LANG, Windows 지역 설정 순으로 정한다.",
+      "required": false,
+      "default": "auto",
+      "options": ["auto", "en", "ko"]
+    }
+  }
 }

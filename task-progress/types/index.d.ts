@@ -6,9 +6,9 @@ export type Task = {
   status: TaskStatus
   /** 0~100. 없으면 done=100, next=0, running=0 으로 본다 */
   percent?: number
-  /** 시작 시각(epoch ms). running 이고 etaSec 가 없으면 이 값과 percent 로 남은 시간을 계산한다 */
+  /** 시작 시각(epoch ms). 선택. 어림한 값이 많아 지금 요청 시작과 모드가 처음 본 시각 사이로 묶어서만 쓴다 */
   startedAt?: number
-  /** 예상 남은 시간(초). 주어지면 계산값보다 우선한다 */
+  /** 예상 소요 시간(초). next 는 그 단계 전체, running 은 남은 시간. 창이 줄여 가며 보여준다 */
   etaSec?: number
   /** 한 줄 부연 */
   note?: string
@@ -58,7 +58,7 @@ export type Change = {
   path: string
   /** 창에 보일 이름. 저장소 루트 기준 상대경로 */
   name: string
-  /** 수정, 새 파일, 삭제, 이름 변경 */
+  /** new, modified, deleted, renamed. 0.7.0 까지는 한국어 문구(새 파일, 수정 등)를 저장했다 */
   status: string
   added: number
   removed: number
@@ -68,6 +68,22 @@ export type Change = {
   summaryKey?: string
   /** 요약에 실패한 이유. 창에 그대로 보인다 */
   summaryError?: string
+}
+
+/** 단계별 남은 시간 기록. 모드가 파일을 읽을 때마다 갱신한다. 키는 제목과 단계 이름 */
+export type TaskTrack = {
+  /** next 였을 때 적힌 etaSec. running 이 됐을 때 첫 예상으로 쓴다 */
+  plan: number | null
+  /** 모드가 정한 시작 시각(epoch ms). running 이 아니면 null */
+  startAt: number | null
+  /** 마지막으로 본 percent */
+  pct: number
+  /** 마지막으로 본 etaSec */
+  eta: number | null
+  /** estAt 시점의 예상 남은 초. null 은 아직 모름 */
+  est: number | null
+  /** est 를 잡은 시각(파일 수정 시각, epoch ms) */
+  estAt: number
 }
 
 declare module 'claude-code' {
@@ -84,6 +100,9 @@ declare module 'claude-code' {
       /** 이 세션에서 Write, Edit, NotebookEdit 로 고친 파일 절대경로(역슬래시는 슬래시로 바꿔 둔다) */
       touched: string[]
       changes: Change[]
+      track: Record<string, TaskTrack>
+      /** 창, 안내문, 요약에 쓰는 언어 */
+      lang: 'ko' | 'en'
     }
   }
 }
